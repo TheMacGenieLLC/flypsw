@@ -9,7 +9,7 @@
 # https://github.com/TheMacGenie/flypsw
 #
 # Current script version:
-currentVersion="2026-06-27 - 01 - Build 100"
+currentVersion="2026-07-19 - 01 - Build 101"
 
 # Global Variable Declarations
 destinationFolder=""
@@ -22,12 +22,14 @@ okToRun="N"
 boldText=$(tput bold 2>/dev/null)
 resetText=$(tput sgr0 2>/dev/null)
 
-# Maximum number of concurrent firmware-catalog lookups. Kept modest to be a
-# good citizen toward the public catalog API while still parallelizing.
+# Maximum number of concurrent file-size lookups for the free-space check.
+# Kept modest to be a good citizen toward Apple's servers while still
+# parallelizing.
 lookupMaxJobs=6
 
 # Verification mode for files already in the destination:
-#   fast     - trust a file whose on-disk size matches the catalog's (cheap).
+#   fast     - trust a file whose zip archive structure reads back complete
+#              (cheap — catches truncation without hashing gigabytes).
 #   thorough - re-hash every existing file in full on every run (slow but
 #              catches silent corruption, not just truncation).
 # Freshly downloaded files are always fully verified regardless of this setting.
@@ -45,7 +47,6 @@ AppleTVsubfolder="Apple TV Software Updates"
 iPadsubfolder="iPad Software Updates"
 iPhonesubfolder="iPhone Software Updates"
 iPodsubfolder="iPod Software Updates"
-Watchsubfolder="Apple Watch Software Updates"
 Othersubfolder="Other Software Updates"
 
 # Lockfile path. Kept per-user (and under the user's own temp directory when
@@ -54,19 +55,21 @@ Othersubfolder="Other Software Updates"
 flypswLockfile="${TMPDIR:-/tmp}/flypsw_lockfile.$(id -u)"
 
 # Temporary paths (initialized at startup — see main execution block).
-flypswDevicesJson=""
-flypswFwDir=""
+flypswCatalogPlist=""
+flypswSizeDir=""
 
 # Global arrays
-# deviceModelList entries:     "identifier|name"
-# latestUnifiedList entries:   "identifier|filename|URL|sha256_hash|filesize"
+# deviceModelList entries:     "identifier" (e.g., iPhone16,1)
+# latestUnifiedList entries:   "identifier|filename|URL|sha1_hash"
 # queuedUnifiedList entries:   subset of latestUnifiedList needing download
 deviceModelList=()
 latestUnifiedList=()
 queuedUnifiedList=()
 
-# Firmware catalog API — queries return download URLs on Apple's CDN
-IPSW_API_BASE="https://api.ipsw.me/v4"
+# Apple's firmware catalog — the version manifest iTunes queried before device
+# restores. One download carries the restore URL and SHA1 hash for every
+# iPhone, iPad, iPod touch, and Apple TV firmware Apple has posted.
+appleCatalogURL="https://itunes.apple.com/WebObjects/MZStore.woa/wa/com.apple.jingle.appserver.client.MZITunesClientCheck/version"
 
 
 # ==============================================================================
@@ -81,8 +84,8 @@ bail_cleanup() {
     # Disarm the trap first so the exit below doesn't re-enter this function.
     trap - EXIT INT TERM
     rm -f "$flypswLockfile"
-    [ -n "$flypswDevicesJson" ] && rm -f "$flypswDevicesJson"
-    [ -n "$flypswFwDir" ]       && rm -rf "$flypswFwDir"
+    [ -n "$flypswCatalogPlist" ] && rm -f "$flypswCatalogPlist"
+    [ -n "$flypswSizeDir" ]      && rm -rf "$flypswSizeDir"
     exit
 }
 
@@ -193,7 +196,6 @@ get_subfolder_for_file() {
         iPad*)     echo "$destinationFolder/$iPadsubfolder" ;;
         iPhone*)   echo "$destinationFolder/$iPhonesubfolder" ;;
         iPod*)     echo "$destinationFolder/$iPodsubfolder" ;;
-        Watch*)    echo "$destinationFolder/$Watchsubfolder" ;;
         *)         echo "$destinationFolder/$Othersubfolder" ;;
     esac
 }
@@ -201,13 +203,14 @@ get_subfolder_for_file() {
 
 # ------------------------------------------------------------------------------
 # verify_sha_hash
-# Verifies a local file's SHA256 hash against a provided hash.
+# Verifies a local file's SHA1 hash against a provided hash. SHA1 is what
+# Apple's catalog publishes for each firmware.
 # Returns 0 on match, non-zero on mismatch.
-# $1 = local file path, $2 = expected SHA256 hash
+# $1 = local file path, $2 = expected SHA1 hash
 # ------------------------------------------------------------------------------
 verify_sha_hash() {
     local shaReturn
-    shaReturn=$(shasum -a 256 "$1" | awk '{print $1}')
+    shaReturn=$(shasum -a 1 "$1" | awk '{print $1}')
     [[ "$2" = "$shaReturn" ]] && return 0 || return 1
 }
 
@@ -221,17 +224,6 @@ verify_sha_hash() {
 # ------------------------------------------------------------------------------
 verify_zip_archive() {
     python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1])" "$1" 2>/dev/null
-}
-
-
-# ------------------------------------------------------------------------------
-# file_size_bytes
-# Prints the size of a file in bytes (BSD stat, as shipped with macOS), or
-# nothing if the file can't be stat'd.
-# $1 = local file path
-# ------------------------------------------------------------------------------
-file_size_bytes() {
-    stat -f%z "$1" 2>/dev/null
 }
 
 
@@ -498,16 +490,18 @@ SECCFG
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# get_device_list
-# Downloads the full device list from the firmware catalog API.
+# get_firmware_catalog
+# Downloads Apple's firmware catalog. This is the version manifest iTunes
+# queried before restoring a device, and the one download (a few megabytes)
+# covers every device — no per-device queries are needed afterward.
 # ------------------------------------------------------------------------------
-get_device_list() {
+get_firmware_catalog() {
     disp_print_header
-    echo "Downloading device list from the firmware catalog..."
+    echo "Downloading Apple's firmware catalog..."
     echo ""
 
-    if ! curl -sf --max-time 30 "$IPSW_API_BASE/devices" -o "$flypswDevicesJson"; then
-        echo "ERROR: Could not download the device list."
+    if ! curl -sf --connect-timeout 15 --max-time 300 "$appleCatalogURL" -o "$flypswCatalogPlist"; then
+        echo "ERROR: Could not download the firmware catalog from Apple."
         echo "Check your internet connection and try again."
         echo ""
         echo "Hit enter to return to the main menu."
@@ -515,7 +509,7 @@ get_device_list() {
         return 1
     fi
 
-    echo "Device list downloaded successfully."
+    echo "Firmware catalog downloaded successfully."
     echo ""
     return 0
 }
@@ -523,8 +517,8 @@ get_device_list() {
 
 # ------------------------------------------------------------------------------
 # build_device_list
-# Filters the downloaded device list by the selected device type(s).
-# Populates the global deviceModelList array.
+# Pulls the device identifiers out of the downloaded catalog, filtered by the
+# selected device type(s). Populates the global deviceModelList array.
 # $1 = filter: "all", or space-separated identifier prefixes (e.g., "iPhone iPad")
 # ------------------------------------------------------------------------------
 build_device_list() {
@@ -538,22 +532,42 @@ build_device_list() {
     # interpolated into the Python source, so untrusted-looking input can never
     # become executable code.
     local deviceLines
-    deviceLines=$(python3 - "$flypswDevicesJson" "$filter" <<'PYEOF' 2>/dev/null
-import json, sys
+    deviceLines=$(python3 - "$flypswCatalogPlist" "$filter" <<'PYEOF' 2>/dev/null
+import plistlib, re, sys
 
 catalogPath = sys.argv[1]
 familyFilter = sys.argv[2]
 
-with open(catalogPath) as f:
-    devices = json.load(f)
+with open(catalogPath, "rb") as f:
+    catalog = plistlib.load(f)
 
 prefixes = None if familyFilter == "all" else familyFilter.split()
 
-for d in devices:
-    identifier = d.get("identifier", "")
-    name = d.get("name", "")
+# Device identifiers are the keys of each version bucket's restore sections.
+# Only keep devices with at least one plain-http(s) restore URL — protected://
+# entries were paid iPod touch upgrades whose download host Apple shut down.
+identifiers = set()
+for bucket in catalog.get("MobileDeviceSoftwareVersionsByVersion", {}).values():
+    for section in ("MobileDeviceSoftwareVersions", "RecoverySoftwareVersions"):
+        for identifier, builds in bucket.get(section, {}).items():
+            if identifier in identifiers:
+                continue
+            for info in builds.values():
+                restore = info.get("Restore") if isinstance(info, dict) else None
+                if restore and restore.get("FirmwareURL", "").startswith("http"):
+                    identifiers.add(identifier)
+                    break
+
+# Sort family-first with numeric model ordering, so iPhone4,1 lists ahead of
+# iPhone16,1 instead of the other way around.
+def modelKey(identifier):
+    family = re.match(r"[A-Za-z]+", identifier)
+    numbers = tuple(int(n) for n in re.findall(r"\d+", identifier))
+    return (family.group(0) if family else identifier, numbers)
+
+for identifier in sorted(identifiers, key=modelKey):
     if prefixes is None or any(identifier.startswith(p) for p in prefixes):
-        print(identifier + "|" + name)
+        print(identifier)
 PYEOF
 )
 
@@ -577,94 +591,75 @@ PYEOF
 
 # ------------------------------------------------------------------------------
 # build_working_array
-# For each device in deviceModelList, fetches firmware data from the catalog in
-# parallel (bounded by lookupMaxJobs) and populates latestUnifiedList with
-# identifier|filename|URL|sha256_hash|filesize entries, preferring signed builds.
+# Walks the downloaded catalog once and, for each device in deviceModelList,
+# picks the newest firmware Apple posts, populating latestUnifiedList with
+# identifier|filename|URL|sha1_hash entries.
 # ------------------------------------------------------------------------------
 build_working_array() {
     disp_print_header
     echo "Retrieving latest IPSW information for ${#deviceModelList[@]} devices..."
-    echo "This may take a few minutes depending on the number of devices selected."
     echo ""
 
-    # Per-device firmware JSON is fetched into a private temp directory so that
-    # parallel lookups never collide on a shared file. The directory is cleaned
-    # up here and again by bail_cleanup on interrupt.
-    flypswFwDir=$(mktemp -d "${TMPDIR:-/tmp}/flypsw_fw.XXXXXX") || return 1
-
-    local total=${#deviceModelList[@]}
-    local idx=0 entry identifier runningJobs
-
-    for entry in "${deviceModelList[@]}"; do
-        idx=$(( idx + 1 ))
-        identifier=${entry%%|*}
-
-        # Throttle to lookupMaxJobs concurrent curls. bash 3.2 has no `wait -n`,
-        # so poll the running-job count with a short sleep.
-        runningJobs=$(jobs -rp | wc -l | tr -d ' ')
-        while [ "$runningJobs" -ge "$lookupMaxJobs" ]; do
-            sleep 0.2
-            runningJobs=$(jobs -rp | wc -l | tr -d ' ')
-        done
-
-        curl -sf --max-time 15 \
-            "$IPSW_API_BASE/device/$identifier?type=ipsw" \
-            -o "$flypswFwDir/$identifier.json" 2>/dev/null &
-
-        printf "\r  Dispatched %d of %d lookups..." "$idx" "$total"
-    done
-
-    echo ""
-    echo "  Waiting for lookups to finish..."
-    wait
-
-    # Parse every per-device JSON in one Python pass: pick the newest *signed*
-    # firmware (an unsigned IPSW can't be restored), fall back to the newest
-    # entry only if none are signed, and emit identifier|filename|url|sha|size.
+    # One Python pass over the whole catalog: for every requested device, look
+    # at every build in every version bucket and keep the highest ProductVersion
+    # that has a usable restore URL. Apple updates the Restore entries in place
+    # as new firmware ships, so the highest version present is what Apple
+    # currently offers for that device.
+    # The catalog path and device identifiers are passed as arguments rather
+    # than interpolated into the Python source, so untrusted-looking input can
+    # never become executable code.
     local resultLines
-    resultLines=$(python3 - "$flypswFwDir" <<'PYEOF' 2>/dev/null
-import json, os, sys
+    resultLines=$(python3 - "$flypswCatalogPlist" "${deviceModelList[@]}" <<'PYEOF' 2>/dev/null
+import plistlib, re, sys
 
-fwDir = sys.argv[1]
+catalogPath = sys.argv[1]
+wanted = sys.argv[2:]
+wantedSet = set(wanted)
 
-for fileName in sorted(os.listdir(fwDir)):
-    if not fileName.endswith(".json"):
+with open(catalogPath, "rb") as f:
+    catalog = plistlib.load(f)
+
+# newest[identifier] = (version_tuple, url, sha1)
+newest = {}
+for bucket in catalog.get("MobileDeviceSoftwareVersionsByVersion", {}).values():
+    for section in ("MobileDeviceSoftwareVersions", "RecoverySoftwareVersions"):
+        for identifier, builds in bucket.get(section, {}).items():
+            if identifier not in wantedSet:
+                continue
+            for info in builds.values():
+                restore = info.get("Restore") if isinstance(info, dict) else None
+                if not restore:
+                    continue
+                url = restore.get("FirmwareURL", "")
+                # Skip protected:// entries — paid iPod touch upgrades whose
+                # download host Apple shut down years ago.
+                if not url.startswith("http"):
+                    continue
+                version = tuple(int(n) for n in
+                                re.findall(r"\d+", restore.get("ProductVersion", "0")))
+                if identifier not in newest or version > newest[identifier][0]:
+                    newest[identifier] = (version, url,
+                                          restore.get("FirmwareSHA1") or "notPresent")
+
+# Apple ships one IPSW for many closely related models (a dozen iPad
+# identifiers can share a single file), so each distinct filename is emitted
+# only once — otherwise the same multi-gigabyte download would be queued
+# repeatedly.
+seenFileNames = set()
+for identifier in wanted:
+    if identifier not in newest:
         continue
-    identifier = fileName[:-5]
-    try:
-        with open(os.path.join(fwDir, fileName)) as f:
-            data = json.load(f)
-    except Exception:
-        continue
-
-    firmwares = data.get("firmwares", [])
-    if not firmwares:
-        continue
-
-    # Don't rely on the catalog's array order: sort newest-first by release date
-    # (ISO-8601 strings sort correctly), then prefer the newest *signed* build,
-    # falling back to the newest overall only if none are signed.
-    firmwares.sort(key=lambda fw: fw.get("releasedate") or "", reverse=True)
-    chosen = next((fw for fw in firmwares if fw.get("signed")), firmwares[0])
-
-    url = chosen.get("url", "")
-    if not url:
-        continue
-    if url.startswith("http://"):
-        url = "https://" + url[len("http://"):]
-
-    sha256 = chosen.get("sha256sum") or "notPresent"
-    filesize = chosen.get("filesize") or 0
+    version, url, sha1 = newest[identifier]
     fileName = url.split("/")[-1].split("?")[0]
-    if not fileName:
+    if not fileName or fileName in seenFileNames:
         continue
-
-    print("|".join([identifier, fileName, url, sha256, str(filesize)]))
+    seenFileNames.add(fileName)
+    # The URL is used exactly as published: Apple's older download hosts are
+    # http-only and error out over https, and integrity is covered by the SHA1
+    # check after download.
+    print("|".join([identifier, fileName, url, sha1]))
 PYEOF
 )
-
-    rm -rf "$flypswFwDir"
-    flypswFwDir=""
 
     if [ -n "$resultLines" ]; then
         while IFS= read -r line; do
@@ -672,11 +667,9 @@ PYEOF
         done <<< "$resultLines"
     fi
 
-    echo ""
-
     if [ ${#latestUnifiedList[@]} -eq 0 ]; then
         echo "No IPSW firmware entries were found."
-        echo "The firmware catalog may be temporarily unavailable."
+        echo "The firmware catalog may not list restore images for the selected devices."
         echo ""
         return 1
     fi
@@ -690,26 +683,26 @@ PYEOF
 # ------------------------------------------------------------------------------
 # check_destination_contents
 # Compares latestUnifiedList against existing files in the destination.
-# Files that are missing or fail SHA256 verification are added to queuedUnifiedList.
+# Files that are missing or fail verification are added to queuedUnifiedList.
 # Returns 1 (and prompts) if nothing needs to be downloaded.
 # ------------------------------------------------------------------------------
 check_destination_contents() {
-    local cdcIdentifier fileToCheck shaToVerify sizeToCheck pathToCheck filePath
+    local cdcIdentifier fileToCheck shaToVerify pathToCheck filePath
     local total=${#latestUnifiedList[@]}
-    local i displayCheckCounter onDiskSize good
+    local i displayCheckCounter good
     queuedUnifiedList=()
 
     disp_print_header
     if [ "$verifyMode" = "thorough" ]; then
         echo "Checking the destination (thorough: full hash of every file)..."
     else
-        echo "Checking the destination (fast: size check of existing files)..."
+        echo "Checking the destination (fast: archive check of existing files)..."
     fi
     echo ""
 
     for (( i = 0; i < total; i++ )); do
         displayCheckCounter=$(( i + 1 ))
-        IFS='|' read -r cdcIdentifier fileToCheck _ shaToVerify sizeToCheck <<< "${latestUnifiedList[$i]}"
+        IFS='|' read -r cdcIdentifier fileToCheck _ shaToVerify <<< "${latestUnifiedList[$i]}"
         pathToCheck=$(get_subfolder_for_file "$cdcIdentifier")
         filePath="$pathToCheck/$fileToCheck"
 
@@ -731,18 +724,10 @@ check_destination_contents() {
                 verify_zip_archive "$filePath" && good="Y"
             fi
         else
-            # Fast check: trust a size match against the catalog. When the catalog
-            # didn't report a size, fall back to the cheap archive-completeness
-            # check rather than hashing the whole file.
-            case "$sizeToCheck" in
-                ''|0|*[!0-9]*)
-                    verify_zip_archive "$filePath" && good="Y"
-                    ;;
-                *)
-                    onDiskSize=$(file_size_bytes "$filePath")
-                    [ "$onDiskSize" = "$sizeToCheck" ] && good="Y"
-                    ;;
-            esac
+            # Fast check: reading the zip archive directory at the end of the
+            # file is cheap and catches the common failure (a truncated
+            # download) without hashing gigabytes.
+            verify_zip_archive "$filePath" && good="Y"
         fi
 
         if [ "$good" != "Y" ]; then
@@ -776,20 +761,55 @@ check_destination_contents() {
 # ------------------------------------------------------------------------------
 # check_free_space
 # Warns if the destination volume may not have room for the queued downloads.
-# Sums the catalog-reported sizes of queuedUnifiedList and compares against the
-# free space reported by df. Sizes the catalog doesn't provide are skipped, so
-# this is advisory only.
+# Apple's catalog doesn't publish file sizes, so sizes are gathered with HEAD
+# requests against the download URLs (bounded by lookupMaxJobs) and compared
+# against the free space reported by df. Files whose size can't be determined
+# are skipped, so this is advisory only.
 # ------------------------------------------------------------------------------
 check_free_space() {
-    local entry sizeField neededBytes=0 availKb neededKb
+    local entry entryURL sizeFile sizeValue neededBytes=0 availKb neededKb
+    local sizeLookupCount=0 runningJobs
+
+    echo "Checking sizes of the queued downloads..."
+    echo ""
+
+    # Per-file sizes land in a private temp directory (one file per lookup) so
+    # parallel requests never collide. The directory is cleaned up here and
+    # again by bail_cleanup on interrupt.
+    flypswSizeDir=$(mktemp -d "${TMPDIR:-/tmp}/flypsw_sizes.XXXXXX") || return 0
 
     for entry in "${queuedUnifiedList[@]}"; do
-        sizeField=${entry##*|}
-        case "$sizeField" in
+        sizeLookupCount=$(( sizeLookupCount + 1 ))
+        IFS='|' read -r _ _ entryURL _ <<< "$entry"
+
+        # Throttle to lookupMaxJobs concurrent curls. bash 3.2 has no `wait -n`,
+        # so poll the running-job count with a short sleep.
+        runningJobs=$(jobs -rp | wc -l | tr -d ' ')
+        while [ "$runningJobs" -ge "$lookupMaxJobs" ]; do
+            sleep 0.2
+            runningJobs=$(jobs -rp | wc -l | tr -d ' ')
+        done
+
+        # -L follows any redirect chain; the awk keeps the last Content-Length
+        # seen, which belongs to the final response in the chain.
+        curl -sfIL --max-time 20 "$entryURL" 2>/dev/null \
+            | tr -d '\r' \
+            | awk 'tolower($1) == "content-length:" { size = $2 } END { if (size) print size }' \
+            > "$flypswSizeDir/$sizeLookupCount" &
+    done
+    wait
+
+    for sizeFile in "$flypswSizeDir"/*; do
+        [ -e "$sizeFile" ] || continue
+        sizeValue=$(cat "$sizeFile")
+        case "$sizeValue" in
             ''|*[!0-9]*) ;;                              # skip non-numeric/unknown
-            *) neededBytes=$(( neededBytes + sizeField )) ;;
+            *) neededBytes=$(( neededBytes + sizeValue )) ;;
         esac
     done
+
+    rm -rf "$flypswSizeDir"
+    flypswSizeDir=""
 
     [ "$neededBytes" -eq 0 ] && return 0
 
@@ -815,17 +835,18 @@ check_free_space() {
 # ------------------------------------------------------------------------------
 # download_queued_ipsws
 # Downloads each IPSW file in queuedUnifiedList to its appropriate subfolder,
-# then verifies the SHA256 hash. Returns the number of failed downloads.
+# then verifies the SHA1 hash. Returns the number of failed downloads.
 # ------------------------------------------------------------------------------
 download_queued_ipsws() {
     downloadFailureCount=0
     local idToDL fileToDL URLtoDL shaToCompare
     local downloadCount downloadTargetPath totalCount remaining curlResult i
+    local stagingPath finalPath verifyResult verifiedMessage
 
     totalCount=${#queuedUnifiedList[@]}
 
     for (( i = 0; i < totalCount; i++ )); do
-        IFS='|' read -r idToDL fileToDL URLtoDL shaToCompare _ <<< "${queuedUnifiedList[$i]}"
+        IFS='|' read -r idToDL fileToDL URLtoDL shaToCompare <<< "${queuedUnifiedList[$i]}"
         downloadCount=$(( i + 1 ))
         remaining=$(( totalCount - downloadCount ))
         downloadTargetPath=$(get_subfolder_for_file "$idToDL")
@@ -838,50 +859,89 @@ download_queued_ipsws() {
         echo "  To:      $downloadTargetPath"
         echo ""
 
-        # -C - resumes a partial transfer; --retry rides out transient network
-        # drops, resuming between attempts rather than restarting from zero.
-        # (Resume requires the server to honor byte ranges; Apple's CDN does. On
-        # a mirror that doesn't, curl returns 33 and flypsw re-downloads cleanly.)
-        curl -L --fail --progress-bar -C - --retry 3 --retry-delay 5 \
-            "$URLtoDL" -o "$downloadTargetPath/$fileToDL"
-        curlResult=$?
+        # Downloads land under a .part staging name and are renamed to the
+        # final name only after passing verification, so the library never
+        # contains an unverified .ipsw. A .part left behind by an interrupted
+        # run is picked up here and resumed rather than restarted.
+        stagingPath="$downloadTargetPath/$fileToDL.part"
+        finalPath="$downloadTargetPath/$fileToDL"
 
-        if [ "$curlResult" != "0" ]; then
-            echo ""
+        # -C - resumes a partial transfer (including a kept .part from an
+        # earlier run); --retry rides out transient network drops, resuming
+        # between attempts rather than restarting from zero.
+        curl -L --fail --progress-bar -C - --retry 3 --retry-delay 5 \
+            "$URLtoDL" -o "$stagingPath"
+        curlResult=$?
+        echo ""
+
+        # Nothing staged at all (DNS failure, immediate HTTP error) — nothing
+        # to salvage or resume, just record the failure.
+        if [ "$curlResult" != "0" ] && [ ! -e "$stagingPath" ]; then
             echo "Download FAILED for $fileToDL (curl error $curlResult)."
-            rm -f "$downloadTargetPath/$fileToDL"
             notify_pushover_send "flypsw: Download failed for $fileToDL."
             downloadFailureCount=$(( downloadFailureCount + 1 ))
             echo ""
             continue
         fi
 
+        if [ "$curlResult" != "0" ]; then
+            # The staged file is still verified below: a resume attempt against
+            # an already-complete .part comes back as a curl error even though
+            # the data on disk is fine, and verification is what tells a
+            # salvageable file apart from a genuinely partial one.
+            echo "Download interrupted for $fileToDL (curl error $curlResult)."
+            echo "Checking whether the staged file is complete anyway..."
+            echo ""
+        fi
+
         # Freshly downloaded files are always fully verified, regardless of the
         # destination-check verifyMode: hash when the catalog provides one,
         # otherwise confirm the archive is structurally complete.
-        echo ""
         if [[ "$shaToCompare" != "notPresent" ]]; then
-            echo "Verifying SHA256 hash..."
-            if ! verify_sha_hash "$downloadTargetPath/$fileToDL" "$shaToCompare"; then
-                echo "Hash verification FAILED — removing corrupt file."
-                rm -f "$downloadTargetPath/$fileToDL"
-                notify_pushover_send "flypsw: Verification failed for $fileToDL — file removed."
-                downloadFailureCount=$(( downloadFailureCount + 1 ))
-                echo ""
-                continue
-            fi
-            echo "Hash verified."
+            echo "Verifying SHA1 hash..."
+            verify_sha_hash "$stagingPath" "$shaToCompare"
+            verifyResult=$?
+            verifiedMessage="Hash verified."
         else
             echo "Verifying archive integrity..."
-            if ! verify_zip_archive "$downloadTargetPath/$fileToDL"; then
-                echo "Archive check FAILED — removing incomplete file."
-                rm -f "$downloadTargetPath/$fileToDL"
-                notify_pushover_send "flypsw: Archive check failed for $fileToDL — file removed."
-                downloadFailureCount=$(( downloadFailureCount + 1 ))
-                echo ""
-                continue
-            fi
-            echo "Archive verified."
+            verify_zip_archive "$stagingPath"
+            verifyResult=$?
+            verifiedMessage="Archive verified."
+        fi
+
+        if [ "$verifyResult" = "0" ]; then
+            mv -f "$stagingPath" "$finalPath"
+            echo "$verifiedMessage"
+        elif [ "$curlResult" = "33" ]; then
+            # The server refused to resume the existing partial file. Clear it
+            # so the next attempt starts this download fresh instead of hitting
+            # the same refusal forever.
+            echo "The server would not resume the partial file — clearing it so the"
+            echo "next run starts this download fresh."
+            rm -f "$stagingPath"
+            notify_pushover_send "flypsw: Download failed for $fileToDL."
+            downloadFailureCount=$(( downloadFailureCount + 1 ))
+            echo ""
+            continue
+        elif [ "$curlResult" != "0" ]; then
+            # Genuinely incomplete: keep the .part so the next run resumes it
+            # from where it stopped instead of starting over.
+            echo "Download incomplete — the partial file is kept so the next run"
+            echo "can resume it."
+            notify_pushover_send "flypsw: Download interrupted for $fileToDL — will resume on the next run."
+            downloadFailureCount=$(( downloadFailureCount + 1 ))
+            echo ""
+            continue
+        else
+            # curl reported success but the content failed verification — a
+            # corrupt transfer. Remove it so nothing broken is ever resumed or
+            # mistaken for good.
+            echo "Verification FAILED — removing corrupt file."
+            rm -f "$stagingPath"
+            notify_pushover_send "flypsw: Verification failed for $fileToDL — file removed."
+            downloadFailureCount=$(( downloadFailureCount + 1 ))
+            echo ""
+            continue
         fi
 
         if [ "$remaining" -gt 0 ]; then
@@ -906,7 +966,6 @@ prep_folder_structure() {
     [[ -d "$destinationFolder/$iPadsubfolder" ]]    || mkdir -p "$destinationFolder/$iPadsubfolder"
     [[ -d "$destinationFolder/$iPhonesubfolder" ]]  || mkdir -p "$destinationFolder/$iPhonesubfolder"
     [[ -d "$destinationFolder/$iPodsubfolder" ]]    || mkdir -p "$destinationFolder/$iPodsubfolder"
-    [[ -d "$destinationFolder/$Watchsubfolder" ]]   || mkdir -p "$destinationFolder/$Watchsubfolder"
     [[ -d "$destinationFolder/$Othersubfolder" ]]   || mkdir -p "$destinationFolder/$Othersubfolder"
 }
 
@@ -921,7 +980,7 @@ run_download_workflow() {
     latestUnifiedList=()
     queuedUnifiedList=()
 
-    get_device_list || return 1
+    get_firmware_catalog || return 1
 
     local filterPrefixes
     case "$deviceTypeSelection" in
@@ -932,8 +991,7 @@ run_download_workflow() {
     5 ) filterPrefixes="AppleTV" ;;
     6 ) filterPrefixes="iPhone iPad" ;;
     7 ) filterPrefixes="iPhone iPad iPod" ;;
-    8 ) filterPrefixes="Watch" ;;
-    9 ) filterPrefixes="all" ;;
+    8 ) filterPrefixes="all" ;;
     * ) return 1 ;;
     esac
 
@@ -984,8 +1042,9 @@ menu_intro() {
         echo ""
         echo "flypsw automates the download of iOS, iPadOS, tvOS, and iPod touch IPSW"
         echo "firmware files. Rather than searching for direct links elsewhere, flypsw"
-        echo "looks up the latest signed firmware via the ipsw.me catalog and downloads"
-        echo "it from Apple's servers to speed up your deployments and testing."
+        echo "reads Apple's own firmware catalog and downloads the newest firmware for"
+        echo "each device straight from Apple's servers to speed up your deployments"
+        echo "and testing."
         echo ""
         echo "Though unlikely to cause data loss or other problems, flypsw is provided"
         echo "as-is. As an open source project, flypsw can be fully audited by the user."
@@ -1036,10 +1095,8 @@ menu_device_type() {
         echo ""
         echo "${boldText}7. iPhone, iPad, and iPod touch${resetText}"
         echo ""
-        echo "${boldText}8. Apple Watch only${resetText}"
-        echo ""
-        echo "${boldText}9. All supported devices${resetText}"
-        echo "   (iPhone, iPad, iPod, Apple TV, Watch, and more)"
+        echo "${boldText}8. All devices in Apple's catalog${resetText}"
+        echo "   (iPhone, iPad, iPod, Apple TV, plus anything else Apple lists)"
         echo ""
         echo "${boldText}X. Return to main menu${resetText}"
         echo ""
@@ -1047,7 +1104,7 @@ menu_device_type() {
         read -r deviceTypeSelection
 
         case "$deviceTypeSelection" in
-        [1-9] )
+        [1-8] )
             ;;
         [Xx] )
             deviceTypeSelection="X"
@@ -1130,7 +1187,7 @@ main_menu() {
             if [ "$verifyMode" = "thorough" ]; then
                 verifyLabel="Thorough (full hash of every file)"
             else
-                verifyLabel="Fast (size check of existing files)"
+                verifyLabel="Fast (archive check of existing files)"
             fi
 
             echo "flypsw Main Menu"
@@ -1199,7 +1256,8 @@ check_instance
 
 trap bail_cleanup EXIT INT TERM
 
-flypswDevicesJson=$(mktemp "${TMPDIR:-/tmp}/flypsw_devices.XXXXXX.json")
+# macOS mktemp only randomizes trailing X's, so the template must end with them.
+flypswCatalogPlist=$(mktemp "${TMPDIR:-/tmp}/flypsw_catalog.XXXXXX")
 
 preflight_check_xcode_cli_tools
 menu_intro

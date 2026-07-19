@@ -1,7 +1,7 @@
 # flypsw User Guide
 
-**Version:** Build 100  
-**Updated:** 2026-06-27  
+**Version:** Build 101  
+**Updated:** 2026-07-19  
 **Author:** Ian Williams  
 **Contact:** [ian@themacgenie.com](ian@themacgenie.com)  
 **Project:** [https://github.com/TheMacGenie/flypsw](https://github.com/TheMacGenie/flypsw)
@@ -31,11 +31,11 @@
 ## Introduction
 
 flypsw automates the download and verification of Apple device firmware — the
-**IPSW** files used to restore or update iPhone, iPad, iPod touch, Apple TV, and
-Apple Watch. Instead of hunting for direct links, copying URLs, and manually
-checking that each download came through intact, flypsw looks up the latest
-firmware for every device you select, downloads anything you don't already have,
-and verifies each file against its published hash — all in a single pass.
+**IPSW** files used to restore or update iPhone, iPad, iPod touch, and Apple TV.
+Instead of hunting for direct links, copying URLs, and manually checking that
+each download came through intact, flypsw reads Apple's own firmware catalog,
+downloads anything you don't already have, and verifies each file against the
+hash Apple publishes — all in a single pass.
 
 Point flypsw at a destination folder and it builds and maintains an organized,
 ready-to-restore firmware library. Run it again later and it downloads only
@@ -56,11 +56,11 @@ family or the entire Apple lineup.
 
 - A reasonably current version of macOS. flypsw runs on both Apple Silicon and
   Intel Macs.
-- The **Xcode Command Line Tools.** flypsw parses the firmware catalog (which is
-  distributed as JSON) with `python3`, which is included in the tools. If they
-  are not present, flypsw offers to install them at launch and then exits so
-  installation can complete.
-- An **internet connection** for the catalog lookups and the downloads
+- The **Xcode Command Line Tools.** flypsw parses Apple's firmware catalog
+  (which is distributed as an XML property list) with `python3`, which is
+  included in the tools. If they are not present, flypsw offers to install them
+  at launch and then exits so installation can complete.
+- An **internet connection** for the catalog download and the downloads
   themselves.
 
 **Storage:**
@@ -110,7 +110,7 @@ flypsw Main Menu
 
 2. Configure Pushover notifications
 
-3. Verification mode: Fast (size check of existing files)
+3. Verification mode: Fast (archive check of existing files)
 
 X. Exit flypsw
 ```
@@ -152,18 +152,21 @@ Select the device types to check for new firmware:
 
 7. iPhone, iPad, and iPod touch
 
-8. Apple Watch only
-
-9. All supported devices
-   (iPhone, iPad, iPod, Apple TV, Watch, and more)
+8. All devices in Apple's catalog
+   (iPhone, iPad, iPod, Apple TV, plus anything else Apple lists)
 
 X. Return to main menu
 ```
 
-Narrowing the selection to the families you actually support keeps catalog
-lookups and downloads quick. Choosing **9 — All supported devices** is the most
-thorough option but checks the largest number of models and can take several
-minutes just to gather firmware information before any download begins.
+Because Apple's catalog arrives in a single download, gathering firmware
+information takes about the same time no matter how many families you select —
+the selection mainly controls how many files end up in your library. Choosing
+**8 — All devices in Apple's catalog** is the most thorough option and also
+picks up the occasional device outside the four main families (such as the
+original HomePod), which is filed under **Other Software Updates**.
+
+Apple Watch firmware does not appear in Apple's catalog — watches were never
+restored through iTunes — so flypsw does not offer it.
 
 ---
 
@@ -195,11 +198,10 @@ IPSW Files/
 ├── iPad Software Updates/
 ├── iPod Software Updates/
 ├── Apple TV Software Updates/
-├── Apple Watch Software Updates/
 └── Other Software Updates/
 ```
 
-Files whose names don't match a known device family are filed under **Other
+Firmware for devices outside the four main families is filed under **Other
 Software Updates** so nothing is lost.
 
 Pointing successive runs at the same destination is the intended workflow:
@@ -213,34 +215,42 @@ library current without re-fetching files you already have.
 Once you've chosen device types and a destination, flypsw runs the full workflow
 on its own:
 
-1. **Catalog download.** flypsw fetches the current device list from the firmware
-   catalog (see [The Firmware Catalog](#the-firmware-catalog)).
-2. **Device filtering.** The list is narrowed to the device families you
-   selected.
-3. **Firmware lookup.** For each device, flypsw retrieves the latest *signed*
-   IPSW's filename, download URL, published SHA256 hash, and size. These lookups
-   run several at a time (in parallel), so even a large selection completes in a
-   fraction of the time a one-at-a-time pass would take.
+1. **Catalog download.** flypsw fetches Apple's firmware catalog — a single
+   download of a few megabytes that covers every device (see
+   [The Firmware Catalog](#the-firmware-catalog)).
+2. **Device filtering.** The catalog's device list is narrowed to the families
+   you selected.
+3. **Firmware lookup.** For each device, flypsw picks out the newest IPSW Apple
+   posts — its filename, download URL, and published SHA1 hash. Because the
+   whole catalog is already on disk, this step needs no further network access.
+   Apple often ships one IPSW for many closely related models (a dozen iPad
+   identifiers can share a single file), and flypsw queues each distinct file
+   only once.
 4. **Destination check.** flypsw compares the latest firmware against what's
    already in the destination and builds a queue of only the files that are
    missing, out of date, or failed verification (see
    [Verification & Self-Healing](#verification--self-healing)).
-5. **Confirmation.** flypsw reports how many files it needs to download, warns if
-   the destination volume may not have room for them, and waits for you to begin
-   (or press Ctrl-C to cancel). If everything is already present and verified, it
-   tells you there's nothing to do and returns to the menu.
-6. **Download & verify.** Each queued file is downloaded with a progress bar and
-   verified as it completes. A download interrupted by a transient network drop
-   resumes from where it left off rather than starting over. When the run
-   finishes, flypsw reports how many files succeeded and how many (if any) failed.
+5. **Confirmation.** flypsw reports how many files it needs to download, checks
+   their sizes against the destination volume's free space (warning if it may
+   not have room), and waits for you to begin (or press Ctrl-C to cancel). If
+   everything is already present and verified, it tells you there's nothing to
+   do and returns to the menu.
+6. **Download & verify.** Each queued file is downloaded with a progress bar
+   under a temporary working name, verified as it completes, and only then
+   renamed into the library. A download interrupted by a transient network drop
+   resumes from where it left off rather than starting over — and if a run is
+   interrupted outright, the next run picks the partial file back up instead of
+   starting from scratch. When the run finishes, flypsw reports how many files
+   succeeded and how many (if any) failed.
 
 If any downloads fail, flypsw removes the incomplete files and suggests running
 it again — a subsequent run simply re-queues whatever is still missing.
 
-> **Why signed firmware?** Apple "signs" the firmware versions it currently
-> allows devices to be restored to. An unsigned (older) IPSW generally cannot be
-> installed, so flypsw selects the newest signed build for each device rather
-> than the newest build overall.
+> **Which firmware gets picked?** Apple keeps its catalog updated as releases
+> ship, so for a device Apple still supports, the newest entry is the version
+> Apple currently signs — the build you can actually restore. For devices Apple
+> no longer updates, the newest entry is the final firmware ever posted, which
+> is exactly what a repair or preservation library wants on hand.
 
 ---
 
@@ -252,23 +262,23 @@ a known-good state.
 **Freshly downloaded files are always fully verified**, no matter which
 verification mode is set:
 
-- **Hash verification.** When the catalog publishes a SHA256 hash, flypsw checks
+- **Hash verification.** When the catalog publishes a SHA1 hash, flypsw checks
   every download against it. A file that doesn't match is deleted immediately so
   it can be re-fetched cleanly.
-- **Integrity check without a hash.** When the catalog provides no hash, flypsw
-  instead confirms the download is a structurally complete archive (IPSW files
-  are zip archives). A partial or truncated download fails this check — because
-  the archive's directory at the end of the file is missing — and is removed.
+- **Integrity check without a hash.** When the catalog provides no hash (true of
+  a handful of the oldest firmware), flypsw instead confirms the download is a
+  structurally complete archive (IPSW files are zip archives). A partial or
+  truncated download fails this check — because the archive's directory at the
+  end of the file is missing — and is removed.
 
 **Files already in the destination** are re-checked according to the
 **verification mode** (Main Menu option 3):
 
-- **Fast (default).** flypsw trusts an existing file whose size matches the
-  catalog's reported size, and only re-downloads when the size differs (which is
-  what a truncated or wrong file looks like). When the catalog didn't report a
-  size, flypsw falls back to the quick archive-completeness check. This keeps
-  repeat runs fast even on a large library, because it avoids re-reading every
-  multi-gigabyte file end to end.
+- **Fast (default).** flypsw confirms each existing file's archive structure
+  reads back complete — the same check described above, which catches the
+  common failure (a truncated file) by reading only the archive's directory.
+  This keeps repeat runs fast even on a large library, because it avoids
+  re-reading every multi-gigabyte file end to end.
 - **Thorough.** flypsw re-hashes every existing file in full (or, lacking a hash,
   re-checks the whole archive). This is much slower on a large library but also
   catches *silent corruption* — a file whose size is unchanged but whose contents
@@ -276,44 +286,62 @@ verification mode is set:
 
 Other safeguards apply in both modes:
 
-- **Resume on transient drops.** Within a download, a brief network interruption
-  is retried automatically and the transfer resumes from where it stopped rather
-  than restarting the whole file (this relies on Apple's servers supporting
-  resumable downloads, which they do).
-- **Clean failures.** A failed or unverifiable download is always removed rather
-  than left in place, so a later run never mistakes a broken file for a good one.
+- **Staged downloads.** Files download under a temporary working name and are
+  renamed into the library only after passing verification, so the library
+  itself never contains an unverified file — even if flypsw is interrupted
+  mid-download or mid-verification.
+- **Resume on transient drops and across runs.** Within a download, a brief
+  network interruption is retried automatically and the transfer resumes from
+  where it stopped rather than restarting the whole file (this relies on
+  Apple's servers supporting resumable downloads, which they do). If a run is
+  interrupted outright, the partial working file is kept, and the next run
+  resumes it from where it stopped. A working file that turns out to be
+  complete already — say, flypsw was interrupted during verification — is
+  verified and kept without re-downloading anything.
+- **Clean failures.** A download whose content fails verification is always
+  removed rather than left in place, so a later run never mistakes a broken
+  file for a good one, and nothing corrupt is ever resumed.
 
 The practical result: you can interrupt flypsw, lose your connection mid-file, or
 simply run it on a schedule, and the next run will repair and complete the
 library without manual cleanup. For unattended/scheduled runs, Fast mode keeps
 each pass quick; switch to Thorough when you want a deep re-verification.
 
-> **Integrity vs. authenticity.** The SHA256 check confirms a file matches the
-> hash the catalog published, which reliably catches a corrupted or truncated
-> download. Because the hash and the download URL come from the same catalog, it
-> is not a guarantee of authenticity against a compromised catalog — Apple's
-> firmware signing, enforced by the device at restore time, is what ultimately
-> governs whether an IPSW can be installed.
+> **Integrity vs. authenticity.** The SHA1 check confirms a file matches the
+> hash Apple's catalog published, which reliably catches a corrupted or
+> truncated download — including for older firmware that Apple still serves
+> over plain http. The catalog itself is fetched from Apple over https, and
+> Apple's firmware signing, enforced by the device at restore time, is what
+> ultimately governs whether an IPSW can be installed.
 
 ---
 
 ## The Firmware Catalog
 
-flypsw looks up device and firmware information from **[ipsw.me](https://ipsw.me)**
-(`api.ipsw.me`), a third-party service that indexes Apple's IPSW releases and
-returns their download URLs on Apple's content-delivery network. flypsw is an
-independent tool and is not affiliated with ipsw.me; the service's availability
-and any rate limits are outside flypsw's control.
+flypsw looks up device and firmware information from **Apple's own firmware
+catalog** — the version manifest at `itunes.apple.com` that iTunes queried
+before restoring a device. Apple still keeps it current as new releases ship,
+and it reaches back to the very first iPhone, iPod touch, and Apple TV
+firmware, so one source covers both this week's release and a restore for a
+device from 2007. No third-party service sits in the middle: the catalog, the
+download URLs, and the hashes all come from Apple.
 
-flypsw queries the catalog in two stages — once for the full device list, and
-then once per selected device for that device's firmware (these per-device
-lookups run several at a time). The IPSW files themselves are downloaded directly
+The catalog arrives in a single download of a few megabytes. flypsw reads the
+device list and the firmware details out of that one local copy, so after the
+initial fetch, gathering firmware information for any number of devices needs
+no further network access. The IPSW files themselves are downloaded directly
 from Apple's content-delivery network using the URLs the catalog provides.
 
-Network failures during lookups are handled gracefully: if the device list can't
-be downloaded, flypsw reports the problem and returns to the menu without making
-changes; if an individual device lookup fails, flypsw skips that device and
-continues with the rest.
+Two quirks of the catalog are worth knowing about. First, Apple Watch firmware
+is not in it — watches were never restored through iTunes — so flypsw does not
+track it. Second, a few of the oldest paid iPod touch upgrades are listed with
+a special protected address whose download server Apple shut down years ago;
+flypsw skips those entries and offers the newest firmware that can actually be
+fetched (for the original iPod touch, that is the last free release rather than
+the paid upgrade).
+
+Network failures are handled gracefully: if the catalog can't be downloaded,
+flypsw reports the problem and returns to the menu without making changes.
 
 ---
 
@@ -361,14 +389,15 @@ your security policy.
 
 flypsw makes network connections in two situations:
 
-1. **Firmware lookups and downloads.** flypsw contacts the ipsw.me catalog to
-   determine the latest firmware for your selected devices, then downloads the
-   IPSW files from Apple's content-delivery network. Every download for which a
-   hash is published is verified against that hash before being kept. As noted in
-   [Verification & Self-Healing](#verification--self-healing), this proves
-   integrity against corruption, not authenticity against a compromised catalog;
-   Apple's firmware signing governs whether a file can actually be restored. flypsw
-   prefers `https` download URLs.
+1. **Firmware lookups and downloads.** flypsw fetches Apple's firmware catalog
+   over `https`, then downloads the IPSW files from Apple's content-delivery
+   network using the URLs exactly as the catalog publishes them. Some older
+   firmware is served from Apple hosts that only answer over plain `http`;
+   every such download is verified against the SHA1 hash from the
+   https-delivered catalog before being kept. As noted in
+   [Verification & Self-Healing](#verification--self-healing), the hash check
+   proves integrity against corruption; Apple's firmware signing governs
+   whether a file can actually be restored.
 2. **Pushover notifications.** Only if you configure them (Main Menu option 2),
    and only to send the notifications you requested.
 
@@ -381,6 +410,52 @@ credentials to your user account; no administrator authorization is required.
 ---
 
 ## Changelog
+
+### Build 101 — 2026-07-19
+
+- **Firmware information now comes directly from Apple.** flypsw reads Apple's
+  own firmware catalog (the version manifest at `itunes.apple.com` that iTunes
+  queried before restoring a device), replacing the third-party ipsw.me catalog
+  used in Build 100. This restores the direct-from-Apple sourcing of flypsw's
+  earliest versions: the catalog, the download URLs, and the verification
+  hashes all come from Apple, with no third-party service in the middle.
+- **One catalog download replaces per-device lookups.** The catalog arrives as
+  a single download of a few megabytes covering every device, so gathering
+  firmware information no longer needs one query per device — large selections
+  are ready as soon as the catalog lands.
+- **Verification now uses Apple's published SHA1 hashes** (the catalog's hash
+  format) in place of ipsw.me's SHA256. Freshly downloaded files are still
+  always fully verified, and the handful of the oldest firmware without a
+  published hash still gets the archive-completeness check.
+- **Fast verification mode now checks archive structure.** Apple's catalog does
+  not publish file sizes, so the Fast re-check of existing files confirms each
+  file's zip archive reads back complete instead of comparing sizes — still
+  quick, and it catches truncation the same way.
+- **The free-space check asks Apple's servers for file sizes** (several at a
+  time) before a run begins, since sizes are no longer in the catalog.
+- **Download URLs are used exactly as Apple publishes them.** Some older
+  firmware lives on Apple hosts that only answer over plain `http`; upgrading
+  those addresses to `https` breaks them, so flypsw no longer rewrites URLs and
+  relies on hash verification for integrity.
+- **Shared firmware is downloaded once.** Apple ships a single IPSW for many
+  closely related models — a dozen iPad identifiers can share one file — and
+  flypsw now queues each distinct file once instead of once per model. On a
+  full-catalog run this avoids re-downloading well over a hundred gigabytes.
+  (The Build 100 catalog shared files the same way, so this corrects an
+  inherited inefficiency as well.)
+- **Downloads are staged and renamed only after verification.** Files download
+  under a temporary working name and enter the library only once verified, so
+  the library never contains an unverified file. A partial file left by an
+  interrupted run is resumed by the next run instead of restarted, and a
+  staged file that turns out to be complete is verified and kept without
+  re-downloading.
+- **Apple Watch support removed.** Watch firmware was only ever available
+  through the third-party catalog — it has never appeared in Apple's own — so
+  the Apple Watch menu option and destination subfolder are gone. The former
+  "all supported devices" option is now "all devices in Apple's catalog."
+- Entries listed with the retired protected-download address (a few of the
+  oldest paid iPod touch upgrades) are skipped in favor of the newest firmware
+  that can actually be fetched.
 
 ### Build 100 — 2026-06-27 (first public release)
 
