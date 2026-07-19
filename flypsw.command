@@ -531,7 +531,7 @@ build_device_list() {
     # The catalog path and the family filter are passed as arguments rather than
     # interpolated into the Python source, so untrusted-looking input can never
     # become executable code.
-    local deviceLines
+    local deviceLines pythonExitStatus
     deviceLines=$(python3 - "$flypswCatalogPlist" "$filter" <<'PYEOF' 2>/dev/null
 import plistlib, re, sys
 
@@ -570,6 +570,17 @@ for identifier in sorted(identifiers, key=modelKey):
         print(identifier)
 PYEOF
 )
+    pythonExitStatus=$?
+
+    if [ "$pythonExitStatus" != "0" ]; then
+        echo "ERROR: Could not parse the firmware catalog."
+        echo "The downloaded file may be incomplete or Apple may have changed its format."
+        echo "Try running flypsw again to re-download the catalog."
+        echo ""
+        echo "Hit enter to return to the main menu."
+        read -r
+        return 1
+    fi
 
     if [ -z "$deviceLines" ]; then
         echo "No devices found for the selected device types."
@@ -608,7 +619,7 @@ build_working_array() {
     # The catalog path and device identifiers are passed as arguments rather
     # than interpolated into the Python source, so untrusted-looking input can
     # never become executable code.
-    local resultLines
+    local resultLines pythonExitStatus
     resultLines=$(python3 - "$flypswCatalogPlist" "${deviceModelList[@]}" <<'PYEOF' 2>/dev/null
 import plistlib, re, sys
 
@@ -651,7 +662,9 @@ for identifier in wanted:
         continue
     version, url, sha1 = newest[identifier]
     fileName = url.split("/")[-1].split("?")[0]
-    if not fileName or fileName in seenFileNames:
+    # Every real entry names a .ipsw file; anything else would be an
+    # unexpected shape in the catalog, so skip it rather than trust it blind.
+    if not fileName.lower().endswith(".ipsw") or fileName in seenFileNames:
         continue
     seenFileNames.add(fileName)
     # The URL is used exactly as published: Apple's older download hosts are
@@ -660,6 +673,15 @@ for identifier in wanted:
     print("|".join([identifier, fileName, url, sha1]))
 PYEOF
 )
+    pythonExitStatus=$?
+
+    if [ "$pythonExitStatus" != "0" ]; then
+        echo "ERROR: Could not parse the firmware catalog."
+        echo "The downloaded file may be incomplete or Apple may have changed its format."
+        echo "Try running flypsw again to re-download the catalog."
+        echo ""
+        return 1
+    fi
 
     if [ -n "$resultLines" ]; then
         while IFS= read -r line; do
@@ -768,7 +790,7 @@ check_destination_contents() {
 # ------------------------------------------------------------------------------
 check_free_space() {
     local entry entryURL sizeFile sizeValue neededBytes=0 availKb neededKb
-    local sizeLookupCount=0 runningJobs
+    local sizeLookupCount=0 runningJobs totalToSize=${#queuedUnifiedList[@]}
 
     echo "Checking sizes of the queued downloads..."
     echo ""
@@ -796,8 +818,14 @@ check_free_space() {
             | tr -d '\r' \
             | awk 'tolower($1) == "content-length:" { size = $2 } END { if (size) print size }' \
             > "$flypswSizeDir/$sizeLookupCount" &
+
+        printf "\r  Dispatched %d of %d size lookups..." "$sizeLookupCount" "$totalToSize"
     done
+
+    echo ""
+    echo "  Waiting for remaining size lookups to finish..."
     wait
+    echo ""
 
     for sizeFile in "$flypswSizeDir"/*; do
         [ -e "$sizeFile" ] || continue
